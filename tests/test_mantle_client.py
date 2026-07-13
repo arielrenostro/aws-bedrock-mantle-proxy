@@ -1,8 +1,8 @@
 """Tests for app.mantle_client: mainly the Anthropic-endpoint payload
 sanitization Mantle currently requires (structured outputs / output_config
 .format, context_management, ... aren't supported there and get rejected
-with a 400 otherwise), plus that client-supplied anthropic-beta opt-ins are
-forwarded rather than silently dropped.
+with a 400 otherwise), plus that the client's anthropic-beta header is never
+forwarded (Mantle rejects unrecognized beta flags outright).
 """
 
 import pytest
@@ -144,12 +144,16 @@ async def test_call_strips_context_management_for_anthropic_contract(monkeypatch
 
 
 # ---------------------------------------------------------------------------
-# anthropic-beta header forwarding
+# anthropic-beta header — deliberately never forwarded. Mantle's Anthropic
+# endpoint returns "invalid beta flag" outright for beta values Claude Code
+# sends by default (e.g. context-management-2025-06-27); since the request
+# fields those betas would gate are already stripped, forwarding the header
+# has no upside and only trades one hard failure for another.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_call_forwards_anthropic_beta_header(monkeypatch):
+async def test_call_never_forwards_anthropic_beta_header(monkeypatch):
     monkeypatch.setattr("app.auth.provide_token", lambda **kw: "tok")
     monkeypatch.setattr(mantle_client.httpx, "AsyncClient", _FakeAsyncClient)
 
@@ -158,15 +162,15 @@ async def test_call_forwards_anthropic_beta_header(monkeypatch):
         Contract.ANTHROPIC, payload, {"anthropic-beta": "context-management-2025-06-27"}
     )
 
-    assert _FakeAsyncClient.last_headers["anthropic-beta"] == "context-management-2025-06-27"
+    assert "anthropic-beta" not in _FakeAsyncClient.last_headers
 
 
 @pytest.mark.asyncio
-async def test_call_omits_anthropic_beta_header_when_client_did_not_send_one(monkeypatch):
+async def test_call_openai_contract_unaffected_by_anthropic_beta_header(monkeypatch):
     monkeypatch.setattr("app.auth.provide_token", lambda **kw: "tok")
     monkeypatch.setattr(mantle_client.httpx, "AsyncClient", _FakeAsyncClient)
 
-    payload = {"model": "anthropic.claude-sonnet-4-6-v1", "messages": []}
-    await mantle_client.call(Contract.ANTHROPIC, payload, {})
+    payload = {"model": "m", "messages": []}
+    await mantle_client.call(Contract.OPENAI, payload, {"anthropic-beta": "context-management-2025-06-27"})
 
     assert "anthropic-beta" not in _FakeAsyncClient.last_headers

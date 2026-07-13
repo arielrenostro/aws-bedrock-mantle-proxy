@@ -81,12 +81,15 @@ def _target(
             "anthropic-version": extra_headers.get("anthropic-version", DEFAULT_ANTHROPIC_VERSION),
             "Content-Type": "application/json",
         }
-        # Forward the client's beta opt-ins verbatim. Some Anthropic-API
-        # fields are only recognized when the matching anthropic-beta value
-        # is present — silently dropping this header (as we used to) makes
-        # the server see fields it doesn't know to expect.
-        if "anthropic-beta" in extra_headers:
-            headers["anthropic-beta"] = extra_headers["anthropic-beta"]
+        # Deliberately NOT forwarding the client's anthropic-beta header:
+        # Mantle's Anthropic endpoint rejects requests outright with
+        # "invalid beta flag" for beta values Claude Code sends by default
+        # (e.g. context-management-2025-06-27) — it doesn't recognize the
+        # same beta surface as the real Anthropic API. Since we already
+        # strip the request fields those betas would gate (see
+        # _strip_unsupported_anthropic_fields above), forwarding the header
+        # serves no purpose here and only trades one hard failure for
+        # another.
     else:
         # Some OpenAI-contract models (e.g. Gemma 4, GPT-5.x) are only
         # reachable on this second, "/openai"-prefixed path — see
