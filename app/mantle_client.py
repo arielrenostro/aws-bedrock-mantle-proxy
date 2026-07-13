@@ -21,30 +21,50 @@ logger = logging.getLogger(__name__)
 DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
 
 
-def _strip_unsupported_anthropic_fields(payload: dict) -> dict:
-    """Mantle's native Anthropic Messages API endpoint doesn't support
-    structured outputs yet — a request carrying `output_config.format` is
-    rejected outright with `400 output_config.format: Extra inputs are not
-    permitted`, even though the field is valid on the real Anthropic API.
-    Claude Code sends it for some internal calls (e.g. session-title
-    generation via a json_schema format), which would otherwise hard-fail
-    every time. Drop just that sub-field rather than failing the whole
-    request; other output_config keys (e.g. effort) are left untouched.
-    """
-    output_config = payload.get("output_config")
-    if not isinstance(output_config, dict) or "format" not in output_config:
-        return payload
+# Top-level fields recent Anthropic SDK / Claude Code versions send that
+# Mantle's native Anthropic Messages API endpoint doesn't yet accept — each
+# rejected with `400 <field>: Extra inputs are not permitted`, even though
+# they're valid (often beta-gated) fields on the real Anthropic API. This is
+# a live gap between Claude Code's feature set and Mantle's Anthropic-
+# endpoint schema, so expect to add to this list over time.
+_UNSUPPORTED_TOP_LEVEL_FIELDS = (
+    "context_management",  # compaction / context-editing beta
+)
 
-    logger.warning(
-        "Dropping unsupported output_config.format before forwarding to Mantle's "
-        "Anthropic endpoint (structured outputs aren't supported there)."
-    )
+# (parent_key, child_key) pairs to strip from a nested object, removing the
+# parent entirely if stripping leaves it empty.
+_UNSUPPORTED_NESTED_FIELDS = (
+    ("output_config", "format"),  # structured outputs
+)
+
+
+def _strip_unsupported_anthropic_fields(payload: dict) -> dict:
+    """Drop request fields Mantle's Anthropic endpoint rejects outright,
+    rather than failing the whole request. See the field tables above for
+    what's currently known to be unsupported and why."""
     payload = dict(payload)
-    remaining = {k: v for k, v in output_config.items() if k != "format"}
-    if remaining:
-        payload["output_config"] = remaining
-    else:
-        payload.pop("output_config", None)
+
+    for field in _UNSUPPORTED_TOP_LEVEL_FIELDS:
+        if field in payload:
+            payload.pop(field)
+            logger.warning(
+                "Dropping unsupported '%s' before forwarding to Mantle's Anthropic endpoint.", field
+            )
+
+    for parent_key, child_key in _UNSUPPORTED_NESTED_FIELDS:
+        parent = payload.get(parent_key)
+        if isinstance(parent, dict) and child_key in parent:
+            remaining = {k: v for k, v in parent.items() if k != child_key}
+            if remaining:
+                payload[parent_key] = remaining
+            else:
+                payload.pop(parent_key, None)
+            logger.warning(
+                "Dropping unsupported '%s.%s' before forwarding to Mantle's Anthropic endpoint.",
+                parent_key,
+                child_key,
+            )
+
     return payload
 
 
@@ -61,6 +81,12 @@ def _target(
             "anthropic-version": extra_headers.get("anthropic-version", DEFAULT_ANTHROPIC_VERSION),
             "Content-Type": "application/json",
         }
+        # Forward the client's beta opt-ins verbatim. Some Anthropic-API
+        # fields are only recognized when the matching anthropic-beta value
+        # is present — silently dropping this header (as we used to) makes
+        # the server see fields it doesn't know to expect.
+        if "anthropic-beta" in extra_headers:
+            headers["anthropic-beta"] = extra_headers["anthropic-beta"]
     else:
         # Some OpenAI-contract models (e.g. Gemma 4, GPT-5.x) are only
         # reachable on this second, "/openai"-prefixed path — see

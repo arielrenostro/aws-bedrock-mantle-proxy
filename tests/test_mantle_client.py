@@ -1,6 +1,8 @@
 """Tests for app.mantle_client: mainly the Anthropic-endpoint payload
 sanitization Mantle currently requires (structured outputs / output_config
-.format aren't supported there and get rejected with a 400 otherwise).
+.format, context_management, ... aren't supported there and get rejected
+with a 400 otherwise), plus that client-supplied anthropic-beta opt-ins are
+forwarded rather than silently dropped.
 """
 
 import pytest
@@ -47,6 +49,29 @@ def test_does_not_mutate_the_original_payload_dict():
     assert original["output_config"] == {"format": {}, "effort": "high"}
 
 
+def test_strips_context_management():
+    payload = {"model": "m", "context_management": {"edits": [{"type": "compact_20260112"}]}}
+    out = _strip_unsupported_anthropic_fields(payload)
+    assert "context_management" not in out
+
+
+def test_leaves_payload_untouched_when_no_context_management():
+    payload = {"model": "m", "messages": []}
+    out = _strip_unsupported_anthropic_fields(payload)
+    assert out == payload
+
+
+def test_strips_both_unsupported_fields_at_once():
+    payload = {
+        "model": "m",
+        "output_config": {"format": {}, "effort": "high"},
+        "context_management": {"edits": []},
+    }
+    out = _strip_unsupported_anthropic_fields(payload)
+    assert "context_management" not in out
+    assert out["output_config"] == {"effort": "high"}
+
+
 # ---------------------------------------------------------------------------
 # call() — sanitization only kicks in for the Anthropic contract
 # ---------------------------------------------------------------------------
@@ -64,6 +89,7 @@ class _FakeHttpxResponse:
 
 class _FakeAsyncClient:
     last_json = None
+    last_headers = None
 
     def __init__(self, *args, **kwargs):
         pass
@@ -76,6 +102,7 @@ class _FakeAsyncClient:
 
     async def post(self, url, headers=None, json=None, **kwargs):
         _FakeAsyncClient.last_json = json
+        _FakeAsyncClient.last_headers = headers
         return _FakeHttpxResponse(json_body={"content": []})
 
 
@@ -103,3 +130,43 @@ async def test_call_does_not_touch_openai_contract_payload(monkeypatch):
     await mantle_client.call(Contract.OPENAI, payload, {})
 
     assert _FakeAsyncClient.last_json == payload
+
+
+@pytest.mark.asyncio
+async def test_call_strips_context_management_for_anthropic_contract(monkeypatch):
+    monkeypatch.setattr("app.auth.provide_token", lambda **kw: "tok")
+    monkeypatch.setattr(mantle_client.httpx, "AsyncClient", _FakeAsyncClient)
+
+    payload = {"model": "anthropic.claude-sonnet-4-6-v1", "context_management": {"edits": []}}
+    await mantle_client.call(Contract.ANTHROPIC, payload, {})
+
+    assert "context_management" not in _FakeAsyncClient.last_json
+
+
+# ---------------------------------------------------------------------------
+# anthropic-beta header forwarding
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_call_forwards_anthropic_beta_header(monkeypatch):
+    monkeypatch.setattr("app.auth.provide_token", lambda **kw: "tok")
+    monkeypatch.setattr(mantle_client.httpx, "AsyncClient", _FakeAsyncClient)
+
+    payload = {"model": "anthropic.claude-sonnet-4-6-v1", "messages": []}
+    await mantle_client.call(
+        Contract.ANTHROPIC, payload, {"anthropic-beta": "context-management-2025-06-27"}
+    )
+
+    assert _FakeAsyncClient.last_headers["anthropic-beta"] == "context-management-2025-06-27"
+
+
+@pytest.mark.asyncio
+async def test_call_omits_anthropic_beta_header_when_client_did_not_send_one(monkeypatch):
+    monkeypatch.setattr("app.auth.provide_token", lambda **kw: "tok")
+    monkeypatch.setattr(mantle_client.httpx, "AsyncClient", _FakeAsyncClient)
+
+    payload = {"model": "anthropic.claude-sonnet-4-6-v1", "messages": []}
+    await mantle_client.call(Contract.ANTHROPIC, payload, {})
+
+    assert "anthropic-beta" not in _FakeAsyncClient.last_headers
