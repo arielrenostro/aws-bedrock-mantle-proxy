@@ -11,7 +11,7 @@ import json
 import re
 import time
 import uuid
-from typing import AsyncIterator
+from typing import AsyncIterator, Any
 
 from ..contracts import Contract
 
