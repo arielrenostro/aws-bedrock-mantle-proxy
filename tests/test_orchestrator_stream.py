@@ -160,3 +160,29 @@ async def test_stream_no_openai_path_prefix_when_target_is_anthropic(monkeypatch
     _ = [c async for c in orchestrator.handle_stream(Contract.OPENAI, body, {})]
 
     assert captured["openai_path_prefix"] is False
+
+
+@pytest.mark.asyncio
+async def test_log_raw_chunks_is_a_faithful_pass_through():
+    """Diagnostic tap added for the Gemma-4-through-Claude-Code report
+    (translated stream produced only message_start/message_delta/
+    message_stop — no way to tell from the outside whether Mantle sent zero
+    chunks or chunks in an unrecognized shape). Must never drop or alter
+    events, only observe them."""
+
+    async def _events():
+        for e in [{"a": 1}, {"b": 2}, {"c": 3}]:
+            yield e
+
+    out = [e async for e in orchestrator._log_raw_chunks(_events())]
+    assert out == [{"a": 1}, {"b": 2}, {"c": 3}]
+
+
+@pytest.mark.asyncio
+async def test_log_raw_chunks_passes_through_empty_stream():
+    async def _events():
+        return
+        yield  # pragma: no cover - makes this an async generator
+
+    out = [e async for e in orchestrator._log_raw_chunks(_events())]
+    assert out == []

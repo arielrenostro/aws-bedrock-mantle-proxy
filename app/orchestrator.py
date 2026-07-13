@@ -6,6 +6,7 @@ dicts and async iterators of SSE text, so it's the seam between the pure
 translation layer and the HTTP-facing routers.
 """
 
+import json
 import logging
 from typing import AsyncIterator
 
@@ -18,6 +19,24 @@ from .model_registry import needs_openai_v1_prefix, resolve_contract
 from .translation import converters as tr
 
 logger = logging.getLogger(__name__)
+
+_RAW_CHUNK_LOG_SAMPLE = 3
+
+
+async def _log_raw_chunks(events: AsyncIterator[dict]) -> AsyncIterator[dict]:
+    """Pass parsed SSE chunks through unchanged, logging a small sample plus
+    the total count. This is the only way to tell, from the logs alone,
+    whether an empty translated stream came from Mantle sending nothing
+    usable versus Mantle sending chunks in a shape the translator doesn't
+    recognize (e.g. a field name other than delta.content) — both look
+    identical downstream without this."""
+    count = 0
+    async for event in events:
+        count += 1
+        if count <= _RAW_CHUNK_LOG_SAMPLE:
+            logger.info("Mantle raw stream chunk #%d: %s", count, json.dumps(event)[:1000])
+        yield event
+    logger.info("Mantle raw stream yielded %d chunk(s) before translation", count)
 
 
 def _translate_request(entry: Contract, target: Contract, body: dict) -> dict:
@@ -110,7 +129,7 @@ async def handle_stream(entry: Contract, body: dict, extra_headers: dict) -> Asy
                     logger.info("Mantle stream ended normally after %d chunk(s)", chunk_count)
                     return
 
-                events = mantle_client.iter_sse_json(resp)
+                events = _log_raw_chunks(mantle_client.iter_sse_json(resp))
                 event_count = 0
                 if entry == Contract.ANTHROPIC:  # target == OPENAI
                     async for event in tr.translate_openai_stream_to_anthropic(events, model):
