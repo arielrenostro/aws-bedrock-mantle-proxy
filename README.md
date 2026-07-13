@@ -1,42 +1,77 @@
 # aws-bedrock-mantle-proxy
 
-Reverse proxy that exposes an **Anthropic**-compatible API (`/v1/messages`) and an **OpenAI**-compatible API (`/v1/chat/completions`, `/v1/models`), forwarding requests to **Amazon Bedrock Mantle** behind the scenes.
+Reverse proxy that exposes an **Anthropic**-compatible API (`/anthropic/v1/messages`) and an **OpenAI**-compatible API (`/openai/v1/chat/completions`, `/openai/v1/models`), forwarding requests to **Amazon Bedrock Mantle** behind the scenes.
 
 This lets you plug tools like **Claude Code**, **QwenCode**, or **Pi Harness** into this local proxy — they still "think" they're talking to Anthropic or OpenAI, but requests are authenticated and forwarded to Mantle.
+
+**You can freely mix entry format and target model.** Mantle serves each model through exactly one of two contracts — its native Anthropic Messages API or its OpenAI-compatible Chat Completions API — but the proxy doesn't force you to speak whichever contract a given model happens to require. Point Claude Code at a Qwen model, or an OpenAI-SDK tool at a Claude model, and the proxy translates transparently in whichever direction is needed.
 
 ## Why this exists
 
 Mantle doesn't allow issuing a static API key due to security requirements. Access must go through the AWS SDK, generating a **short-lived bearer token** on every call with the [`aws-bedrock-token-generator`](https://pypi.org/project/aws-bedrock-token-generator/) library, derived from AWS credentials already configured on the machine (profile, SSO, assumed role, environment variables, etc.).
 
-Mantle already natively exposes an OpenAI-compatible API at `https://bedrock-mantle.{region}.api.aws/v1`. This proxy:
+Mantle natively exposes **two separate contracts** at the same host (`https://bedrock-mantle.{region}.api.aws`), and a given model is only reachable through one of them:
 
-1. Forwards OpenAI-shaped calls almost directly (injecting the token on every request).
-2. Translates Anthropic Messages API calls into OpenAI format before sending them to Mantle, and translates the response back — including streaming (SSE).
+| Contract | Mantle path | Model families | Auth header |
+|---|---|---|---|
+| OpenAI-compatible | `/v1/chat/completions`, `/v1/models` | GPT and open-weight models (Qwen, Llama, etc.) | `Authorization: Bearer <token>` |
+| Native Anthropic Messages API | `/anthropic/v1/messages` | Claude models | `x-api-key: <token>` |
 
-## Architecture
+## Architecture (onion-style layers)
 
 ```
 app/
+  contracts.py                    # Contract enum (ANTHROPIC | OPENAI) — the shared vocabulary
   config.py                       # environment variables / configuration
   auth.py                         # mints a fresh Mantle token on every request
-  main.py                         # FastAPI app, registers the routers
-  routers/
-    anthropic_router.py           # POST /v1/messages  (translates Anthropic <-> OpenAI)
-    openai_router.py              # GET /v1/models, POST /v1/chat/completions (passthrough)
-  translation/
-    anthropic_to_openai.py        # request: Anthropic Messages -> OpenAI Chat Completions
-    openai_to_anthropic.py        # response: OpenAI (JSON and streaming SSE) -> Anthropic Messages
+  main.py                         # FastAPI app, registers the routers, configures logging
+
+  routers/                        # ── outermost layer: HTTP adapters ──
+    anthropic_entry.py            # POST /anthropic/v1/messages
+    openai_entry.py                # GET /openai/v1/models, POST /openai/v1/chat/completions
+
+  orchestrator.py                 # ── application layer ──
+                                   # resolves the target contract, decides whether to
+                                   # translate, calls Mantle, translates the response back
+
+  translation/converters.py       # ── domain layer, pure functions, no I/O ──
+                                   # bidirectional request/response/stream/error translation
+                                   # between the Anthropic and OpenAI wire formats
+
+  mantle_client.py                # ── infrastructure layer ──
+                                   # the only module that speaks HTTP to Mantle: URLs,
+                                   # per-contract auth headers, streaming, decompression
+
+  model_registry.py               # resolves model_id -> Contract (see below)
+  model_contracts.json            # explicit model_id -> contract overrides
+
 tests/
-  test_translation.py             # unit tests for the translation layer (no network/AWS)
+  test_converters.py              # translation layer, no network/AWS
+  test_model_registry.py          # contract resolution, no network/AWS
+  test_orchestrator_stream.py     # streaming routing (raw relay vs. translated), no network/AWS
+  test_routing.py                 # HTTP layer end-to-end, mantle_client monkeypatched
+
 main.py                           # entrypoint (uvicorn)
 ```
 
-### Flow
+Dependencies only point inward: routers depend on the orchestrator; the orchestrator depends on `mantle_client`, `model_registry`, and `translation.converters`; those depend only on `auth`/`config`/`contracts`. `translation/converters.py` has zero I/O, so every translation rule is unit-tested directly with plain dicts.
 
-- **OpenAI-compatible tools** (QwenCode, Pi Harness, generic OpenAI SDK) → `POST /v1/chat/completions` or `GET /v1/models` → proxy injects the Bearer token → forwards to Mantle without modifying the body.
-- **Claude Code** (speaks the Anthropic format) → `POST /v1/messages` → proxy translates the request into OpenAI format, calls Mantle, translates the response (or stream) back into Anthropic format.
+### Request flow
 
-The model name (`model`) is passed through exactly as the client sends it — **there is no friendly-name mapping**. Use `GET /v1/models` to list the real IDs available on Bedrock and point your tools directly at them.
+1. **Router** (`/anthropic/...` or `/openai/...`) parses the incoming body and hands it to the **orchestrator** along with which contract the client is speaking (the *entry* contract).
+2. **Orchestrator** asks `model_registry.resolve_contract(model_id)` which contract Mantle actually needs for that model (the *target* contract).
+3. If entry == target, the body is forwarded unmodified (no translation risk, no overhead).
+4. If they differ, the **translation layer** converts the request into the target's wire format.
+5. **`mantle_client`** calls Mantle with the correct URL/auth header for the target contract (streaming or not).
+6. If entry == target, the response (or SSE stream) is relayed back as-is. If they differ, the **translation layer** converts the response (or SSE stream) back into the entry contract's shape.
+
+### How the target contract is resolved
+
+`model_registry.resolve_contract(model_id)`, in order:
+
+1. **Mantle's own `GET /v1/models` listing** (best-effort, cached for 5 minutes) — if a model entry ever carries an explicit field naming its supported API, that wins. In practice Mantle's listing doesn't expose this today, which is exactly why step 2 exists.
+2. **`app/model_contracts.json`** — an explicit, hand-maintained `{"model_id": "anthropic"|"openai"}` mapping. This is the place to correct or pin any model the automatic resolution gets wrong. Override the file location with `MODEL_CONTRACTS_FILE`.
+3. **Prefix heuristic** as a last resort: `anthropic.*` model IDs → Anthropic contract, everything else → OpenAI contract (this matches how Bedrock actually names Claude models today). A warning is logged whenever this fallback is used, so you know which models are worth adding to the JSON file.
 
 ## Prerequisites
 
@@ -64,11 +99,12 @@ cp .env.example .env
 | Variable | Default | Description |
 |---|---|---|
 | `AWS_REGION` | `us-east-1` | Region where Bedrock Mantle is available |
-| `MANTLE_BASE_URL` | `https://bedrock-mantle.{AWS_REGION}.api.aws/v1` | Override for the Mantle endpoint |
+| `MANTLE_BASE_URL` | `https://bedrock-mantle.{AWS_REGION}.api.aws` | Override for the Mantle host root (the proxy appends `/v1/...` or `/anthropic/v1/...` itself) |
 | `BEDROCK_TOKEN_TTL_SECONDS` | `3600` | Requested lifetime for each generated token (max 12h / 43200s) |
 | `MANTLE_REQUEST_TIMEOUT_SECONDS` | `300` | Timeout for requests forwarded to Mantle |
 | `PROXY_HOST` | `0.0.0.0` | Bind address for the local server |
 | `PROXY_PORT` | `8000` | Port for the local server |
+| `MODEL_CONTRACTS_FILE` | `app/model_contracts.json` | Path to the model_id -> contract override file |
 
 ## Running
 
@@ -82,31 +118,37 @@ The server starts at `http://localhost:8000` (or the configured port). Check it 
 curl http://localhost:8000/healthz
 ```
 
+The console logs, for every request: the resolved entry/target contract, the status code and headers Mantle returned for streaming requests, and how many chunks/events were relayed or translated — useful for diagnosing upstream or routing issues.
+
 ## Connecting your tools
 
 ### Claude Code (Anthropic)
 
 ```bash
-export ANTHROPIC_BASE_URL=http://localhost:8000
+export ANTHROPIC_BASE_URL=http://localhost:8000/anthropic
 export ANTHROPIC_API_KEY=any-value   # ignored by the proxy; real auth happens against Mantle
 ```
+
+Works with any model Mantle serves, Claude or not — e.g. point it at `qwen.qwen3-coder-30b-a3b-instruct` and the proxy translates the Anthropic-shaped request into OpenAI shape before calling Mantle.
 
 ### OpenAI-compatible tools (QwenCode, Pi Harness, OpenAI SDK)
 
 ```bash
-export OPENAI_BASE_URL=http://localhost:8000/v1
+export OPENAI_BASE_URL=http://localhost:8000/openai/v1
 export OPENAI_API_KEY=any-value      # ignored by the proxy; real auth happens against Mantle
 ```
+
+Same in reverse — point it at `anthropic.claude-sonnet-4-6-v1` and the proxy translates into the native Anthropic contract before calling Mantle, then translates the response back into an OpenAI-shaped `chat.completion`.
 
 List the models available on Bedrock:
 
 ```bash
-curl http://localhost:8000/v1/models
+curl http://localhost:8000/openai/v1/models
 ```
 
 ## Tests
 
-The translation tests are unit tests and make no network calls or require AWS credentials:
+All tests are unit/integration tests with `mantle_client` monkeypatched — no real network calls or AWS credentials required:
 
 ```bash
 pytest tests/ -v
@@ -115,5 +157,5 @@ pytest tests/ -v
 ## Known limitations
 
 - `/v1/messages/count_tokens` (Anthropic) is not implemented.
-- On **streaming** responses from `/v1/messages`, the `usage` field may come back zeroed if Mantle doesn't send a final chunk with usage information. Non-streaming responses report real usage.
-- There is no friendly model-name mapping — the `model` value is passed through exactly as sent by the client tool.
+- Mantle's `/v1/models` listing doesn't currently expose which contract a model supports, so contract resolution normally falls through to `model_contracts.json` / the prefix heuristic — keep the JSON file up to date for any model that doesn't follow the `anthropic.*` naming convention.
+- Translated requests/responses cover text, images, tool use, and streaming; less common fields (e.g. `logprobs`, `n`, prompt caching hints) are not translated and are dropped when crossing contracts. Same-contract requests are always forwarded byte-for-byte, so nothing is ever lost when the client already speaks the target model's native contract.

@@ -1,0 +1,102 @@
+"""Ties the layers together: resolve which contract the target model needs,
+translate the request if the entry contract differs from it, call Mantle,
+translate the response back. This module has no FastAPI/httpx-specific
+knowledge beyond what `mantle_client` already exposes — it deals in plain
+dicts and async iterators of SSE text, so it's the seam between the pure
+translation layer and the HTTP-facing routers.
+"""
+
+import logging
+from typing import AsyncIterator
+
+import httpx
+
+from . import mantle_client
+from .contracts import Contract
+from .model_registry import resolve_contract
+from .translation import converters as tr
+
+logger = logging.getLogger(__name__)
+
+
+def _translate_request(entry: Contract, target: Contract, body: dict) -> dict:
+    if entry == target:
+        return body
+    if entry == Contract.ANTHROPIC:  # target == OPENAI
+        return tr.anthropic_request_to_openai(body)
+    return tr.openai_request_to_anthropic(body)  # entry == OPENAI, target == ANTHROPIC
+
+
+def _translate_response(entry: Contract, target: Contract, model: str, resp_body: dict) -> dict:
+    if entry == target:
+        return resp_body
+    if entry == Contract.ANTHROPIC:  # response came back in OPENAI shape
+        return tr.openai_response_to_anthropic(resp_body, model)
+    return tr.anthropic_response_to_openai(resp_body, model)  # response came back in ANTHROPIC shape
+
+
+def _translate_error(entry: Contract, target: Contract, resp_body: dict) -> dict:
+    if entry == target:
+        return resp_body
+    if entry == Contract.ANTHROPIC:
+        return tr.openai_error_to_anthropic(resp_body)
+    return tr.anthropic_error_to_openai(resp_body)
+
+
+async def handle_request(entry: Contract, body: dict, extra_headers: dict) -> tuple[int, dict]:
+    model = body.get("model", "")
+    target = await resolve_contract(model)
+    logger.info("Routing model=%s entry=%s target=%s", model, entry.value, target.value)
+
+    payload = _translate_request(entry, target, body)
+    status, resp_body, _ = await mantle_client.call(target, payload, extra_headers)
+
+    if status >= 400:
+        return status, _translate_error(entry, target, resp_body)
+    return status, _translate_response(entry, target, model, resp_body)
+
+
+async def handle_stream(entry: Contract, body: dict, extra_headers: dict) -> AsyncIterator[bytes | str]:
+    model = body.get("model", "")
+    target = await resolve_contract(model)
+    logger.info("Routing (stream) model=%s entry=%s target=%s", model, entry.value, target.value)
+
+    payload = _translate_request(entry, target, body)
+
+    try:
+        async with mantle_client.open_stream(target, payload, extra_headers) as resp:
+            logger.info(
+                "Mantle %s stream status=%s headers=%s", target.value, resp.status_code, dict(resp.headers)
+            )
+            if resp.status_code >= 400:
+                error_body = await resp.aread()
+                logger.error(
+                    "Mantle returned an error for a streaming request: %s %s",
+                    resp.status_code,
+                    error_body[:2000],
+                )
+                yield tr.format_error_sse(entry, error_body)
+                return
+
+            if entry == target:
+                chunk_count = 0
+                async for chunk in resp.aiter_bytes():
+                    chunk_count += 1
+                    yield chunk
+                logger.info("Mantle stream ended normally after %d chunk(s)", chunk_count)
+                return
+
+            events = mantle_client.iter_sse_json(resp)
+            event_count = 0
+            if entry == Contract.ANTHROPIC:  # target == OPENAI
+                async for event in tr.translate_openai_stream_to_anthropic(events, model):
+                    event_count += 1
+                    yield event
+            else:  # entry == OPENAI, target == ANTHROPIC
+                async for event in tr.translate_anthropic_stream_to_openai(events, model):
+                    event_count += 1
+                    yield event
+            logger.info("Mantle stream translated into %d event(s)", event_count)
+    except httpx.HTTPError as exc:
+        logger.exception("Mantle stream request failed: %s", exc)
+        yield tr.format_error_sse(entry, str(exc).encode())

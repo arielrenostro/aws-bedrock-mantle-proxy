@@ -1,0 +1,7 @@
+{
+  "_comment": "Explicit model_id -> contract ('anthropic' or 'openai') overrides. Checked before Mantle's /v1/models response and before the anthropic./non-anthropic. prefix heuristic. Add an entry here whenever a model doesn't follow the default rule.",
+  "anthropic.claude-sonnet-4-6-v1": "anthropic",
+  "anthropic.claude-opus-4-7": "anthropic",
+  "anthropic.claude-opus-4-8": "anthropic",
+  "anthropic.claude-haiku-4-5": "anthropic"
+}
