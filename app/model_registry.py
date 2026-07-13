@@ -1,9 +1,12 @@
 """Resolves which Mantle contract (Anthropic-native vs OpenAI-compatible) a
-given model ID must be called through, and — for OpenAI-contract models —
-whether Mantle serves it on the standard `/v1/...` path or the `/openai/v1/...`
-prefixed path (some models, e.g. Gemma 4 and GPT-5.x, are only reachable on
-the latter; calling the wrong one returns a confusing permission-denied
-error rather than a clean 404).
+given model ID must be called through, and two more per-model quirks needed
+to actually get a working request to Mantle:
+- whether it's served on the standard `/v1/...` path or the `/openai/v1/...`
+  prefixed path (some models, e.g. Gemma 4 and GPT-5.x, are only reachable
+  on the latter; calling the wrong one returns a confusing permission-denied
+  error rather than a clean 404);
+- whether it supports parallel tool calls (Gemma 4 doesn't — requesting one
+  anyway can fail generation server-side).
 
 Contract resolution order:
 1. Mantle's own `GET /v1/models` listing, best-effort — if a model entry
@@ -55,29 +58,32 @@ def _load_overrides() -> dict[str, str | dict]:
     return {k: v for k, v in raw.items() if not k.startswith("_")}
 
 
-def _normalize_override(value: str | dict) -> tuple[Contract | None, bool]:
-    """Parse one model_contracts.json entry into (contract, openai_path_prefix).
+def _normalize_override(value: str | dict) -> tuple[Contract | None, bool, bool]:
+    """Parse one model_contracts.json entry into (contract, openai_path_prefix,
+    disable_parallel_tool_calls).
 
     Accepts the legacy bare-string form ("anthropic"/"openai") or the
-    extended object form ({"contract": ..., "openai_path_prefix": ...}).
-    Returns (None, False) for anything malformed so callers fall back to
-    other resolution steps instead of crashing on a bad override.
+    extended object form ({"contract": ..., "openai_path_prefix": ...,
+    "disable_parallel_tool_calls": ...}). Returns (None, False, False) for
+    anything malformed so callers fall back to other resolution steps
+    instead of crashing on a bad override.
     """
     if isinstance(value, str):
         try:
-            return Contract(value), False
+            return Contract(value), False, False
         except ValueError:
-            return None, False
+            return None, False, False
     if isinstance(value, dict):
         try:
             contract = Contract(value["contract"])
         except (KeyError, ValueError):
             contract = None
         # Strict `is True` so a stray non-boolean JSON value (a string, a
-        # number) never gets silently coerced into "needs the prefix".
+        # number) never gets silently coerced into "true".
         prefix = value.get("openai_path_prefix") is True
-        return contract, prefix
-    return None, False
+        disable_parallel = value.get("disable_parallel_tool_calls") is True
+        return contract, prefix, disable_parallel
+    return None, False, False
 
 
 def _heuristic_contract(model_id: str) -> Contract:
@@ -131,7 +137,7 @@ async def resolve_contract(model_id: str) -> Contract:
 
     overrides = _load_overrides()
     if model_id in overrides:
-        contract, _ = _normalize_override(overrides[model_id])
+        contract, _, _ = _normalize_override(overrides[model_id])
         if contract is not None:
             return contract
         logger.warning(
@@ -163,5 +169,27 @@ def needs_openai_v1_prefix(model_id: str) -> bool:
     overrides = _load_overrides()
     if model_id not in overrides:
         return False
-    _, prefix = _normalize_override(overrides[model_id])
+    _, prefix, _ = _normalize_override(overrides[model_id])
     return prefix
+
+
+def disable_parallel_tool_calls(model_id: str) -> bool:
+    """Whether the request translated for this model should force
+    `parallel_tool_calls: false`.
+
+    Anthropic models support parallel tool use and Claude Code relies on it
+    by default, so a request translated from the Anthropic contract has no
+    signal against it otherwise. Some OpenAI-contract models don't support
+    multiple tool calls in one turn at all (confirmed for the Gemma 4
+    family per its Bedrock model card: "Requesting more than one tool call
+    in a single turn is not currently supported") — asking anyway can fail
+    the whole generation server-side rather than just returning calls one
+    at a time. Purely static, like needs_openai_v1_prefix; a model absent
+    from the overrides file defaults to False (no restriction). Meaningless
+    when the resolved target contract is Anthropic.
+    """
+    overrides = _load_overrides()
+    if model_id not in overrides:
+        return False
+    _, _, disable_parallel = _normalize_override(overrides[model_id])
+    return disable_parallel

@@ -249,3 +249,40 @@ def test_openai_entry_defaults_no_prefix_for_unflagged_model(monkeypatch, tmp_pa
     )
     assert resp.status_code == 200
     assert calls[0]["openai_path_prefix"] is False
+
+
+def test_anthropic_entry_to_gemma_disables_parallel_tool_calls(monkeypatch, tmp_path):
+    """Claude Code (Anthropic entry) talking to Gemma 4 (OpenAI target): the
+    translated request sent to Mantle must carry parallel_tool_calls=False,
+    or Gemma's generation fails outright server-side."""
+    from app.contracts import Contract
+
+    overrides_file = tmp_path / "overrides.json"
+    overrides_file.write_text(
+        json.dumps({"google.gemma-4-31b": {"contract": "openai", "disable_parallel_tool_calls": True}})
+    )
+    monkeypatch.setattr(model_registry, "_overrides_path", lambda: overrides_file)
+
+    calls = []
+    monkeypatch.setattr(
+        mantle_client,
+        "call",
+        _fake_call(
+            Contract.OPENAI,
+            {"choices": [{"message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}], "usage": {}},
+            calls,
+        ),
+    )
+
+    resp = client.post(
+        "/anthropic/v1/messages",
+        json={
+            "model": "google.gemma-4-31b",
+            "max_tokens": 50,
+            "messages": [{"role": "user", "content": "weather?"}],
+            "tools": [{"name": "get_weather", "description": "d", "input_schema": {"type": "object"}}],
+        },
+    )
+
+    assert resp.status_code == 200
+    assert calls[0]["payload"]["parallel_tool_calls"] is False

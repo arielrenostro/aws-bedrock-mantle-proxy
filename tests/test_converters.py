@@ -66,6 +66,38 @@ def test_anthropic_request_to_openai_tool_use_round_trip():
     assert out["tool_choice"] == "auto"
 
 
+def test_anthropic_request_to_openai_disables_parallel_tool_calls_when_requested():
+    """Regression test: Gemma 4 on Mantle rejects generation outright if the
+    model attempts more than one tool call per turn, and Claude Code (which
+    relies on Anthropic's native parallel tool use) gives no signal against
+    it otherwise — the translator has to set this explicitly per model."""
+    body = {
+        "model": "google.gemma-4-31b",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": [{"name": "get_weather", "description": "d", "input_schema": {"type": "object"}}],
+    }
+    out = anthropic_request_to_openai(body, disable_parallel_tool_calls=True)
+    assert out["parallel_tool_calls"] is False
+
+
+def test_anthropic_request_to_openai_leaves_parallel_tool_calls_unset_by_default():
+    body = {
+        "model": "m",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": [{"name": "get_weather", "description": "d", "input_schema": {"type": "object"}}],
+    }
+    out = anthropic_request_to_openai(body)
+    assert "parallel_tool_calls" not in out
+
+
+def test_anthropic_request_to_openai_no_parallel_tool_calls_field_without_tools():
+    body = {"model": "m", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]}
+    out = anthropic_request_to_openai(body, disable_parallel_tool_calls=True)
+    assert "parallel_tool_calls" not in out
+
+
 # ---------------------------------------------------------------------------
 # OpenAI request -> Anthropic request
 # ---------------------------------------------------------------------------

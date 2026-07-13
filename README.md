@@ -42,8 +42,8 @@ app/
                                    # the only module that speaks HTTP to Mantle: URLs,
                                    # per-contract auth headers, streaming, decompression
 
-  model_registry.py               # resolves model_id -> Contract, and -> openai_path_prefix (see below)
-  model_contracts.json            # explicit model_id -> contract (+ optional openai_path_prefix) overrides
+  model_registry.py               # resolves model_id -> Contract, openai_path_prefix, disable_parallel_tool_calls
+  model_contracts.json            # explicit model_id -> contract (+ optional per-model quirks) overrides
 
 tests/
   test_converters.py              # translation layer, no network/AWS
@@ -70,7 +70,7 @@ Dependencies only point inward: routers depend on the orchestrator; the orchestr
 `model_registry.resolve_contract(model_id)`, in order:
 
 1. **Mantle's own `GET /v1/models` listing** (best-effort, cached for 5 minutes) — if a model entry ever carries an explicit field naming its supported API, that wins. In practice Mantle's listing doesn't expose this today, which is exactly why step 2 exists.
-2. **`app/model_contracts.json`** — an explicit, hand-maintained mapping of `model_id` to either a contract string (`"anthropic"` or `"openai"`) or, for OpenAI-contract models that need the path prefix described below, an object `{"contract": "openai", "openai_path_prefix": true}`. This is the place to correct or pin any model the automatic resolution gets wrong. Override the file location with `MODEL_CONTRACTS_FILE`.
+2. **`app/model_contracts.json`** — an explicit, hand-maintained mapping of `model_id` to either a contract string (`"anthropic"` or `"openai"`) or, for OpenAI-contract models with the per-model quirks described below, an object `{"contract": "openai", "openai_path_prefix": true, "disable_parallel_tool_calls": true}` (both extra keys optional, default `false`). This is the place to correct or pin any model the automatic resolution gets wrong. Override the file location with `MODEL_CONTRACTS_FILE`.
 3. **Prefix heuristic** as a last resort: `anthropic.*` model IDs → Anthropic contract, everything else → OpenAI contract (this matches how Bedrock actually names Claude models today). A warning is logged whenever this fallback is used, so you know which models are worth adding to the JSON file.
 
 #### The `/openai/v1/...` path prefix
@@ -87,6 +87,16 @@ Calling the wrong path doesn't 404 — it returns a confusing `access_denied` / 
 ```
 
 A model absent from the overrides file defaults to the standard (no-prefix) path. `model_registry.needs_openai_v1_prefix(model_id)` is only consulted when the resolved target contract is OpenAI — it's meaningless (and ignored) for the Anthropic contract. Add new model IDs here as AWS/Mantle exposes them.
+
+#### Parallel tool calls
+
+Claude Code relies on Anthropic's native parallel tool use — it's on by default and there's nothing in a request that turns it *off*. Some OpenAI-contract models don't support it at all: per Gemma 4's Bedrock model card, *"Requesting more than one tool call in a single turn is not currently supported"* — asking anyway doesn't just fall back to one call at a time, it fails the whole generation server-side (`Task submission failed... Generation failed`, with no other indication of why). Since a translated Anthropic → OpenAI request otherwise carries no signal against parallel calls, this has to be forced explicitly per model, the same way as the path prefix above:
+
+```json
+"google.gemma-4-31b": {"contract": "openai", "openai_path_prefix": true, "disable_parallel_tool_calls": true}
+```
+
+When set, the translated request sent to Mantle carries `"parallel_tool_calls": false`. `model_registry.disable_parallel_tool_calls(model_id)` is only consulted when translating *into* the OpenAI contract (i.e. entry is Anthropic, target is OpenAI) and only when the request has `tools` at all — like the path prefix, a model absent from the file defaults to unrestricted (`false`, i.e. the field is omitted from the translated request rather than forced).
 
 ## Prerequisites
 
@@ -139,7 +149,7 @@ Every log line — including the ones `httpx` itself emits for each request it s
 
 ```
 2026-07-13 17:31:06 INFO httpx [model=google.gemma-4-31b]: HTTP Request: POST https://bedrock-mantle.../openai/v1/chat/completions "HTTP/1.1 200 OK"
-2026-07-13 17:31:06 INFO app.orchestrator [model=google.gemma-4-31b]: Routing entry=openai target=openai openai_path_prefix=True
+2026-07-13 17:31:06 INFO app.orchestrator [model=google.gemma-4-31b]: Routing entry=anthropic target=openai openai_path_prefix=True disable_parallel_tool_calls=True
 ```
 
 ## Connecting your tools
@@ -179,7 +189,8 @@ pytest tests/ -v
 ## Known limitations
 
 - `/v1/messages/count_tokens` (Anthropic) is not implemented.
-- Mantle's `/v1/models` listing doesn't currently expose which contract a model supports, so contract resolution normally falls through to `model_contracts.json` / the prefix heuristic — keep the JSON file up to date for any model that doesn't follow the `anthropic.*` naming convention. Likewise, whether an OpenAI-contract model needs the `/openai/v1/...` path prefix instead of the standard `/v1/...` path can't be derived from the catalog either — it's tracked via `openai_path_prefix` in the same file and must be updated by hand as AWS adds more such models.
+- Mantle's `/v1/models` listing doesn't currently expose which contract a model supports, so contract resolution normally falls through to `model_contracts.json` / the prefix heuristic — keep the JSON file up to date for any model that doesn't follow the `anthropic.*` naming convention. Likewise, neither the `/openai/v1/...` path prefix nor per-model capability limits (e.g. Gemma 4's lack of parallel tool call support) can be derived from the catalog — both are tracked via `openai_path_prefix` / `disable_parallel_tool_calls` in the same file and must be updated by hand as AWS adds more such models or documents more constraints.
+- Gemma 4's documented 3.5 MB total request-payload limit isn't enforced or checked by the proxy — a request that exceeds it (plausible with Claude Code's large tool schemas and long conversation history) will surface as the same opaque `Task submission failed... Generation failed` mid-stream error described above, not a clear "payload too large" message.
 - Translated requests/responses cover text, images, tool use, and streaming; less common fields (e.g. `logprobs`, `n`, prompt caching hints) are not translated and are dropped when crossing contracts. Same-contract requests are always forwarded byte-for-byte, so nothing is ever lost when the client already speaks the target model's native contract.
 - Mantle's native Anthropic Messages API endpoint rejects several request fields recent Claude Code / Anthropic SDK versions send by default, each with `400 <field>: Extra inputs are not permitted` — currently `output_config.format` (structured outputs) and `context_management` (compaction / context-editing). `mantle_client._strip_unsupported_anthropic_fields` drops just those fields before forwarding to the Anthropic contract (logging a warning each time), leaving everything else — e.g. `output_config.effort` — untouched. This list is expected to grow as Claude Code adopts newer Anthropic API surface faster than Mantle's Anthropic-compatible endpoint catches up; add new entries to `_UNSUPPORTED_TOP_LEVEL_FIELDS` / `_UNSUPPORTED_NESTED_FIELDS` in `app/mantle_client.py` as they're found.
 - The proxy never forwards the client's `anthropic-beta` header to Mantle's Anthropic contract — Mantle rejects requests outright with `400 invalid beta flag` for beta values Claude Code sends by default (e.g. `context-management-2025-06-27`), since it doesn't recognize the same beta surface as the real Anthropic API. This is deliberate, not an oversight: since the request fields those betas would gate are already stripped (previous bullet), forwarding the header would only trade one hard failure for another.

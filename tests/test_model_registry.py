@@ -154,3 +154,46 @@ def test_real_shipped_overrides_file_flags_gemma_4():
     only test that exercises app/model_contracts.json as shipped, without
     monkeypatching _overrides_path."""
     assert model_registry.needs_openai_v1_prefix("google.gemma-4-31b") is True
+
+
+# ---------------------------------------------------------------------------
+# disable_parallel_tool_calls — Gemma 4 rejects generation outright if asked
+# for more than one tool call per turn; Bedrock's model card confirms this
+# is a hard model limitation, not a translation bug.
+# ---------------------------------------------------------------------------
+
+
+def test_disable_parallel_tool_calls_true_for_flagged_override(monkeypatch, tmp_path):
+    overrides_file = tmp_path / "overrides.json"
+    overrides_file.write_text(
+        json.dumps({"google.gemma-4-31b": {"contract": "openai", "disable_parallel_tool_calls": True}})
+    )
+    monkeypatch.setattr(model_registry, "_overrides_path", lambda: overrides_file)
+    assert model_registry.disable_parallel_tool_calls("google.gemma-4-31b") is True
+
+
+def test_disable_parallel_tool_calls_false_when_key_absent(monkeypatch, tmp_path):
+    overrides_file = tmp_path / "overrides.json"
+    overrides_file.write_text(json.dumps({"custom.model": {"contract": "openai"}}))
+    monkeypatch.setattr(model_registry, "_overrides_path", lambda: overrides_file)
+    assert model_registry.disable_parallel_tool_calls("custom.model") is False
+
+
+def test_disable_parallel_tool_calls_false_when_model_not_in_overrides(monkeypatch, tmp_path):
+    monkeypatch.setattr(model_registry, "_overrides_path", lambda: tmp_path / "does-not-exist.json")
+    assert model_registry.disable_parallel_tool_calls("qwen.qwen3-coder-30b-a3b-instruct") is False
+
+
+def test_disable_parallel_tool_calls_false_for_bare_string_override(monkeypatch, tmp_path):
+    overrides_file = tmp_path / "overrides.json"
+    overrides_file.write_text(json.dumps({"anthropic.claude-sonnet-4-6-v1": "anthropic"}))
+    monkeypatch.setattr(model_registry, "_overrides_path", lambda: overrides_file)
+    assert model_registry.disable_parallel_tool_calls("anthropic.claude-sonnet-4-6-v1") is False
+
+
+def test_real_shipped_overrides_file_disables_parallel_tool_calls_for_gemma_4():
+    for model_id in ("google.gemma-4-31b", "google.gemma-4-e2b", "google.gemma-4-26b-a4b"):
+        assert model_registry.disable_parallel_tool_calls(model_id) is True
+    # Grok 4.3 needs the /openai path prefix but isn't documented as having
+    # the parallel-tool-call limitation — must not be flagged by accident.
+    assert model_registry.disable_parallel_tool_calls("xai.grok-4.3") is False

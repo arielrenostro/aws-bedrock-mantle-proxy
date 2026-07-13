@@ -15,7 +15,11 @@ import httpx
 from . import mantle_client
 from .contracts import Contract
 from .logging_context import current_model
-from .model_registry import needs_openai_v1_prefix, resolve_contract
+from .model_registry import (
+    disable_parallel_tool_calls as model_disables_parallel_tool_calls,
+    needs_openai_v1_prefix,
+    resolve_contract,
+)
 from .translation import converters as tr
 
 logger = logging.getLogger(__name__)
@@ -39,11 +43,13 @@ async def _log_raw_chunks(events: AsyncIterator[dict]) -> AsyncIterator[dict]:
     logger.info("Mantle raw stream yielded %d chunk(s) before translation", count)
 
 
-def _translate_request(entry: Contract, target: Contract, body: dict) -> dict:
+def _translate_request(entry: Contract, target: Contract, body: dict, model: str) -> dict:
     if entry == target:
         return body
     if entry == Contract.ANTHROPIC:  # target == OPENAI
-        return tr.anthropic_request_to_openai(body)
+        return tr.anthropic_request_to_openai(
+            body, disable_parallel_tool_calls=model_disables_parallel_tool_calls(model)
+        )
     return tr.openai_request_to_anthropic(body)  # entry == OPENAI, target == ANTHROPIC
 
 
@@ -70,11 +76,16 @@ async def handle_request(entry: Contract, body: dict, extra_headers: dict) -> tu
     model = body.get("model", "")
     target = await resolve_contract(model)
     openai_path_prefix = needs_openai_v1_prefix(model) if target == Contract.OPENAI else False
+    no_parallel_tools = model_disables_parallel_tool_calls(model) if target == Contract.OPENAI else False
     logger.info(
-        "Routing entry=%s target=%s openai_path_prefix=%s", entry.value, target.value, openai_path_prefix
+        "Routing entry=%s target=%s openai_path_prefix=%s disable_parallel_tool_calls=%s",
+        entry.value,
+        target.value,
+        openai_path_prefix,
+        no_parallel_tools,
     )
 
-    payload = _translate_request(entry, target, body)
+    payload = _translate_request(entry, target, body, model)
     status, resp_body, _ = await mantle_client.call(
         target, payload, extra_headers, openai_path_prefix=openai_path_prefix
     )
@@ -95,14 +106,16 @@ async def handle_stream(entry: Contract, body: dict, extra_headers: dict) -> Asy
     try:
         target = await resolve_contract(model)
         openai_path_prefix = needs_openai_v1_prefix(model) if target == Contract.OPENAI else False
+        no_parallel_tools = model_disables_parallel_tool_calls(model) if target == Contract.OPENAI else False
         logger.info(
-            "Routing (stream) entry=%s target=%s openai_path_prefix=%s",
+            "Routing (stream) entry=%s target=%s openai_path_prefix=%s disable_parallel_tool_calls=%s",
             entry.value,
             target.value,
             openai_path_prefix,
+            no_parallel_tools,
         )
 
-        payload = _translate_request(entry, target, body)
+        payload = _translate_request(entry, target, body, model)
 
         try:
             async with mantle_client.open_stream(

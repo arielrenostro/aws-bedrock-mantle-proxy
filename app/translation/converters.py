@@ -181,7 +181,7 @@ def _anthropic_tool_choice_to_openai(tool_choice: dict | None):
     return "auto"
 
 
-def anthropic_request_to_openai(body: dict) -> dict:
+def anthropic_request_to_openai(body: dict, disable_parallel_tool_calls: bool = False) -> dict:
     openai_body: dict = {
         "model": body["model"],
         "messages": _anthropic_messages_to_openai(body.get("messages", []), body.get("system")),
@@ -202,6 +202,16 @@ def anthropic_request_to_openai(body: dict) -> dict:
         tool_choice = _anthropic_tool_choice_to_openai(body.get("tool_choice"))
         if tool_choice is not None:
             openai_body["tool_choice"] = tool_choice
+        if disable_parallel_tool_calls:
+            # Anthropic models support parallel tool use and Claude Code
+            # relies on it by default, so the translated request has no
+            # signal against it. Some OpenAI-contract models (e.g. Gemma 4)
+            # don't support multiple tool calls in one turn at all — asking
+            # for one anyway can fail the whole generation server-side
+            # rather than just returning calls one at a time. Only set this
+            # when the target model is known not to support it (see
+            # model_registry.disable_parallel_tool_calls).
+            openai_body["parallel_tool_calls"] = False
 
     return openai_body
 
