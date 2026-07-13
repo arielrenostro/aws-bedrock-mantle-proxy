@@ -34,7 +34,15 @@ async def chat_completions(request: Request):
             headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
             async with httpx.AsyncClient(timeout=settings.request_timeout) as client:
                 async with client.stream("POST", url, json=body, headers=headers) as resp:
-                    async for chunk in resp.aiter_raw():
+                    if resp.status_code >= 400:
+                        error_body = await resp.aread()
+                        yield error_body
+                        return
+                    # aiter_bytes() decodes any Content-Encoding (gzip/deflate/br)
+                    # from Mantle before forwarding — aiter_raw() would pass the
+                    # still-compressed bytes straight through as if they were
+                    # plain SSE text, corrupting the stream for the client.
+                    async for chunk in resp.aiter_bytes():
                         yield chunk
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
