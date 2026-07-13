@@ -42,8 +42,8 @@ app/
                                    # the only module that speaks HTTP to Mantle: URLs,
                                    # per-contract auth headers, streaming, decompression
 
-  model_registry.py               # resolves model_id -> Contract (see below)
-  model_contracts.json            # explicit model_id -> contract overrides
+  model_registry.py               # resolves model_id -> Contract, and -> openai_path_prefix (see below)
+  model_contracts.json            # explicit model_id -> contract (+ optional openai_path_prefix) overrides
 
 tests/
   test_converters.py              # translation layer, no network/AWS
@@ -70,8 +70,23 @@ Dependencies only point inward: routers depend on the orchestrator; the orchestr
 `model_registry.resolve_contract(model_id)`, in order:
 
 1. **Mantle's own `GET /v1/models` listing** (best-effort, cached for 5 minutes) — if a model entry ever carries an explicit field naming its supported API, that wins. In practice Mantle's listing doesn't expose this today, which is exactly why step 2 exists.
-2. **`app/model_contracts.json`** — an explicit, hand-maintained `{"model_id": "anthropic"|"openai"}` mapping. This is the place to correct or pin any model the automatic resolution gets wrong. Override the file location with `MODEL_CONTRACTS_FILE`.
+2. **`app/model_contracts.json`** — an explicit, hand-maintained mapping of `model_id` to either a contract string (`"anthropic"` or `"openai"`) or, for OpenAI-contract models that need the path prefix described below, an object `{"contract": "openai", "openai_path_prefix": true}`. This is the place to correct or pin any model the automatic resolution gets wrong. Override the file location with `MODEL_CONTRACTS_FILE`.
 3. **Prefix heuristic** as a last resort: `anthropic.*` model IDs → Anthropic contract, everything else → OpenAI contract (this matches how Bedrock actually names Claude models today). A warning is logged whenever this fallback is used, so you know which models are worth adding to the JSON file.
+
+#### The `/openai/v1/...` path prefix
+
+Within the OpenAI-compatible contract itself, Mantle actually has **two** URL paths, and a given model is only reachable on one of them:
+
+- `/v1/chat/completions` — the standard path, used by default.
+- `/openai/v1/chat/completions` — a second path that some models (currently `openai.gpt-5.5`, `openai.gpt-5.4`, `google.gemma-4-31b`, `google.gemma-4-e2b`, `google.gemma-4-26b-a4b`, `xai.grok-4.3`) are served on **exclusively**.
+
+Calling the wrong path doesn't 404 — it returns a confusing `access_denied` / `permission_denied_error` response instead, which is easy to mistake for a real permissions problem. Which path a model needs can't be derived from the model catalog either, so — exactly like contract resolution — it's tracked purely via `model_contracts.json`:
+
+```json
+"google.gemma-4-31b": {"contract": "openai", "openai_path_prefix": true}
+```
+
+A model absent from the overrides file defaults to the standard (no-prefix) path. `model_registry.needs_openai_v1_prefix(model_id)` is only consulted when the resolved target contract is OpenAI — it's meaningless (and ignored) for the Anthropic contract. Add new model IDs here as AWS/Mantle exposes them.
 
 ## Prerequisites
 
@@ -120,6 +135,13 @@ curl http://localhost:8000/healthz
 
 The console logs, for every request: the resolved entry/target contract, the status code and headers Mantle returned for streaming requests, and how many chunks/events were relayed or translated — useful for diagnosing upstream or routing issues.
 
+Every log line — including the ones `httpx` itself emits for each request it sends to Mantle (`HTTP Request: POST ... "HTTP/1.1 200 OK"`) — is tagged with `[model=...]` for the model that request was made for. This works via a `contextvars`-backed `logging.Filter` (`app/logging_context.py`) attached to the root log handler, so it applies to any logger, not just the app's own, without needing to touch `httpx`'s internals:
+
+```
+2026-07-13 17:31:06 INFO httpx [model=google.gemma-4-31b]: HTTP Request: POST https://bedrock-mantle.../openai/v1/chat/completions "HTTP/1.1 200 OK"
+2026-07-13 17:31:06 INFO app.orchestrator [model=google.gemma-4-31b]: Routing entry=openai target=openai openai_path_prefix=True
+```
+
 ## Connecting your tools
 
 ### Claude Code (Anthropic)
@@ -157,5 +179,5 @@ pytest tests/ -v
 ## Known limitations
 
 - `/v1/messages/count_tokens` (Anthropic) is not implemented.
-- Mantle's `/v1/models` listing doesn't currently expose which contract a model supports, so contract resolution normally falls through to `model_contracts.json` / the prefix heuristic — keep the JSON file up to date for any model that doesn't follow the `anthropic.*` naming convention.
+- Mantle's `/v1/models` listing doesn't currently expose which contract a model supports, so contract resolution normally falls through to `model_contracts.json` / the prefix heuristic — keep the JSON file up to date for any model that doesn't follow the `anthropic.*` naming convention. Likewise, whether an OpenAI-contract model needs the `/openai/v1/...` path prefix instead of the standard `/v1/...` path can't be derived from the catalog either — it's tracked via `openai_path_prefix` in the same file and must be updated by hand as AWS adds more such models.
 - Translated requests/responses cover text, images, tool use, and streaming; less common fields (e.g. `logprobs`, `n`, prompt caching hints) are not translated and are dropped when crossing contracts. Same-contract requests are always forwarded byte-for-byte, so nothing is ever lost when the client already speaks the target model's native contract.

@@ -1,7 +1,13 @@
 {
-  "_comment": "Explicit model_id -> contract ('anthropic' or 'openai') overrides. Checked before Mantle's /v1/models response and before the anthropic./non-anthropic. prefix heuristic. Add an entry here whenever a model doesn't follow the default rule.",
+  "_comment": "Explicit model_id -> contract overrides, checked before Mantle's /v1/models response and before the anthropic./non-anthropic. prefix heuristic. Value is either a bare string (\"anthropic\" or \"openai\") or, for OpenAI-contract models Mantle only serves on the '/openai/v1/...' path instead of the standard '/v1/...' path, an object {\"contract\": \"openai\", \"openai_path_prefix\": true}. See README 'How the target contract is resolved'.",
   "anthropic.claude-sonnet-4-6-v1": "anthropic",
   "anthropic.claude-opus-4-7": "anthropic",
   "anthropic.claude-opus-4-8": "anthropic",
-  "anthropic.claude-haiku-4-5": "anthropic"
+  "anthropic.claude-haiku-4-5": "anthropic",
+  "openai.gpt-5.5": {"contract": "openai", "openai_path_prefix": true},
+  "openai.gpt-5.4": {"contract": "openai", "openai_path_prefix": true},
+  "google.gemma-4-31b": {"contract": "openai", "openai_path_prefix": true},
+  "google.gemma-4-e2b": {"contract": "openai", "openai_path_prefix": true},
+  "google.gemma-4-26b-a4b": {"contract": "openai", "openai_path_prefix": true},
+  "xai.grok-4.3": {"contract": "openai", "openai_path_prefix": true}
 }

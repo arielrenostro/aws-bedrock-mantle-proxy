@@ -5,10 +5,13 @@ layer — that a client can freely mix its entry format with a model that
 needs the *other* Mantle contract and still get a correctly-shaped response.
 """
 
+import json
+
 import pytest
 from fastapi.testclient import TestClient
 
 import app.mantle_client as mantle_client
+import app.model_registry as model_registry
 from app.main import app
 
 client = TestClient(app)
@@ -30,8 +33,15 @@ def _fake_token(monkeypatch):
 
 
 def _fake_call(expected_contract, response_body, calls: list):
-    async def fake_call(contract, payload, extra_headers):
-        calls.append({"contract": contract, "payload": payload, "headers": extra_headers})
+    async def fake_call(contract, payload, extra_headers, openai_path_prefix=False):
+        calls.append(
+            {
+                "contract": contract,
+                "payload": payload,
+                "headers": extra_headers,
+                "openai_path_prefix": openai_path_prefix,
+            }
+        )
         assert contract == expected_contract
         return 200, response_body, {}
 
@@ -184,3 +194,58 @@ def test_unknown_paths_404():
     assert client.get("/v1/models").status_code == 404
     assert client.post("/v1/messages", json={}).status_code == 404
     assert client.post("/v1/chat/completions", json={}).status_code == 404
+
+
+def test_openai_entry_uses_openai_path_prefix_for_flagged_model(monkeypatch, tmp_path):
+    """Regression test for Gemma 4 / GPT-5.x-style models that Mantle only
+    serves on /openai/v1/chat/completions, not the bare /v1/chat/completions
+    (calling the wrong one returns a confusing permission-denied error)."""
+    from app.contracts import Contract
+
+    overrides_file = tmp_path / "overrides.json"
+    overrides_file.write_text(
+        json.dumps({"google.gemma-4-31b": {"contract": "openai", "openai_path_prefix": True}})
+    )
+    monkeypatch.setattr(model_registry, "_overrides_path", lambda: overrides_file)
+
+    calls = []
+    monkeypatch.setattr(
+        mantle_client,
+        "call",
+        _fake_call(
+            Contract.OPENAI,
+            {"choices": [{"message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}], "usage": {}},
+            calls,
+        ),
+    )
+
+    resp = client.post(
+        "/openai/v1/chat/completions",
+        json={"model": "google.gemma-4-31b", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert resp.status_code == 200
+    assert calls[0]["openai_path_prefix"] is True
+
+
+def test_openai_entry_defaults_no_prefix_for_unflagged_model(monkeypatch, tmp_path):
+    from app.contracts import Contract
+
+    monkeypatch.setattr(model_registry, "_overrides_path", lambda: tmp_path / "does-not-exist.json")
+
+    calls = []
+    monkeypatch.setattr(
+        mantle_client,
+        "call",
+        _fake_call(
+            Contract.OPENAI,
+            {"choices": [{"message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}], "usage": {}},
+            calls,
+        ),
+    )
+
+    resp = client.post(
+        "/openai/v1/chat/completions",
+        json={"model": "qwen.qwen3-coder-30b-a3b-instruct", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert resp.status_code == 200
+    assert calls[0]["openai_path_prefix"] is False

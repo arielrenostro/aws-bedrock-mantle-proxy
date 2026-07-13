@@ -2,6 +2,7 @@
 relayed as raw bytes, cross-contract streams get parsed and translated.
 """
 
+import json
 from contextlib import asynccontextmanager
 
 import pytest
@@ -32,9 +33,10 @@ class _FakeStreamResponse:
 
 def _fake_open_stream(response: _FakeStreamResponse, captured: dict):
     @asynccontextmanager
-    async def fake(contract, payload, extra_headers):
+    async def fake(contract, payload, extra_headers, openai_path_prefix=False):
         captured["contract"] = contract
         captured["payload"] = payload
+        captured["openai_path_prefix"] = openai_path_prefix
         yield response
 
     return fake
@@ -111,3 +113,50 @@ async def test_stream_error_status_is_translated_to_entry_error_shape(monkeypatc
 
     assert '"message": "bad model id"' in joined
     assert '"type": "api_error"' in joined
+
+
+@pytest.mark.asyncio
+async def test_stream_passes_openai_path_prefix_for_flagged_model(monkeypatch, tmp_path):
+    overrides_file = tmp_path / "overrides.json"
+    overrides_file.write_text(
+        json.dumps({"google.gemma-4-31b": {"contract": "openai", "openai_path_prefix": True}})
+    )
+    monkeypatch.setattr(model_registry, "_overrides_path", lambda: overrides_file)
+
+    lines = ['data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}', "data: [DONE]"]
+    response = _FakeStreamResponse(200, lines)
+    captured: dict = {}
+    monkeypatch.setattr(mantle_client, "open_stream", _fake_open_stream(response, captured))
+
+    body = {"model": "google.gemma-4-31b", "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+    _ = [c async for c in orchestrator.handle_stream(Contract.OPENAI, body, {})]
+
+    assert captured["openai_path_prefix"] is True
+
+
+@pytest.mark.asyncio
+async def test_stream_no_openai_path_prefix_when_target_is_anthropic(monkeypatch, tmp_path):
+    """Even if the overrides file (hypothetically) had prefix data keyed to
+    this model, target == ANTHROPIC must force openai_path_prefix False —
+    the flag only means something for the OpenAI contract."""
+    overrides_file = tmp_path / "overrides.json"
+    overrides_file.write_text(json.dumps({"anthropic.claude-sonnet-4-6-v1": "anthropic"}))
+    monkeypatch.setattr(model_registry, "_overrides_path", lambda: overrides_file)
+
+    lines = [
+        'data: {"type":"message_start","message":{"usage":{"input_tokens":1}}}',
+        'data: {"type":"content_block_stop","index":0}',
+        'data: {"type":"message_stop"}',
+    ]
+    response = _FakeStreamResponse(200, lines)
+    captured: dict = {}
+    monkeypatch.setattr(mantle_client, "open_stream", _fake_open_stream(response, captured))
+
+    body = {
+        "model": "anthropic.claude-sonnet-4-6-v1",
+        "stream": True,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    _ = [c async for c in orchestrator.handle_stream(Contract.OPENAI, body, {})]
+
+    assert captured["openai_path_prefix"] is False

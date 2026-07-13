@@ -80,3 +80,77 @@ async def test_mantle_listing_failure_does_not_crash_resolution(monkeypatch, tmp
 
     contract = await model_registry.resolve_contract("anthropic.claude-sonnet-4-6-v1")
     assert contract == Contract.ANTHROPIC
+
+
+# ---------------------------------------------------------------------------
+# needs_openai_v1_prefix — the /openai/v1/... path variant some OpenAI-
+# contract models (Gemma 4, GPT-5.x, ...) are exclusively served on.
+# ---------------------------------------------------------------------------
+
+
+def test_needs_openai_v1_prefix_true_for_flagged_override(monkeypatch, tmp_path):
+    overrides_file = tmp_path / "overrides.json"
+    overrides_file.write_text(
+        json.dumps({"google.gemma-4-31b": {"contract": "openai", "openai_path_prefix": True}})
+    )
+    monkeypatch.setattr(model_registry, "_overrides_path", lambda: overrides_file)
+    assert model_registry.needs_openai_v1_prefix("google.gemma-4-31b") is True
+
+
+def test_needs_openai_v1_prefix_false_for_bare_string_override(monkeypatch, tmp_path):
+    overrides_file = tmp_path / "overrides.json"
+    overrides_file.write_text(json.dumps({"anthropic.claude-sonnet-4-6-v1": "anthropic"}))
+    monkeypatch.setattr(model_registry, "_overrides_path", lambda: overrides_file)
+    assert model_registry.needs_openai_v1_prefix("anthropic.claude-sonnet-4-6-v1") is False
+
+
+def test_needs_openai_v1_prefix_false_when_model_not_in_overrides(monkeypatch, tmp_path):
+    monkeypatch.setattr(model_registry, "_overrides_path", lambda: tmp_path / "does-not-exist.json")
+    assert model_registry.needs_openai_v1_prefix("qwen.qwen3-coder-30b-a3b-instruct") is False
+
+
+def test_needs_openai_v1_prefix_false_when_prefix_key_absent(monkeypatch, tmp_path):
+    overrides_file = tmp_path / "overrides.json"
+    overrides_file.write_text(json.dumps({"custom.model": {"contract": "openai"}}))
+    monkeypatch.setattr(model_registry, "_overrides_path", lambda: overrides_file)
+    assert model_registry.needs_openai_v1_prefix("custom.model") is False
+
+
+@pytest.mark.asyncio
+async def test_resolve_contract_works_with_object_form_override(monkeypatch, tmp_path):
+    async def fake_list_models():
+        return 200, {"data": []}, {}
+
+    monkeypatch.setattr(model_registry.mantle_client, "list_models", fake_list_models)
+
+    overrides_file = tmp_path / "overrides.json"
+    overrides_file.write_text(
+        json.dumps({"google.gemma-4-31b": {"contract": "openai", "openai_path_prefix": True}})
+    )
+    monkeypatch.setattr(model_registry, "_overrides_path", lambda: overrides_file)
+
+    contract = await model_registry.resolve_contract("google.gemma-4-31b")
+    assert contract == Contract.OPENAI
+
+
+@pytest.mark.asyncio
+async def test_resolve_contract_falls_back_to_heuristic_on_malformed_object_override(monkeypatch, tmp_path):
+    async def fake_list_models():
+        return 200, {"data": []}, {}
+
+    monkeypatch.setattr(model_registry.mantle_client, "list_models", fake_list_models)
+
+    overrides_file = tmp_path / "overrides.json"
+    # Missing the required "contract" key.
+    overrides_file.write_text(json.dumps({"custom.weird-model": {"openai_path_prefix": True}}))
+    monkeypatch.setattr(model_registry, "_overrides_path", lambda: overrides_file)
+
+    contract = await model_registry.resolve_contract("custom.weird-model")
+    assert contract == Contract.OPENAI  # heuristic default, no "anthropic." prefix
+
+
+def test_real_shipped_overrides_file_flags_gemma_4():
+    """Cheap regression guard against a typo in the actual seed file — the
+    only test that exercises app/model_contracts.json as shipped, without
+    monkeypatching _overrides_path."""
+    assert model_registry.needs_openai_v1_prefix("google.gemma-4-31b") is True

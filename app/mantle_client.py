@@ -21,7 +21,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
 
 
-def _target(contract: Contract, extra_headers: dict, token: str) -> tuple[str, dict]:
+def _target(
+    contract: Contract, extra_headers: dict, token: str, openai_path_prefix: bool = False
+) -> tuple[str, dict]:
     if contract == Contract.ANTHROPIC:
         url = f"{settings.mantle_base_url}/anthropic/v1/messages"
         headers = {
@@ -33,15 +35,21 @@ def _target(contract: Contract, extra_headers: dict, token: str) -> tuple[str, d
             "Content-Type": "application/json",
         }
     else:
-        url = f"{settings.mantle_base_url}/v1/chat/completions"
+        # Some OpenAI-contract models (e.g. Gemma 4, GPT-5.x) are only
+        # reachable on this second, "/openai"-prefixed path — see
+        # model_registry.needs_openai_v1_prefix for how this is decided.
+        path = "/openai/v1/chat/completions" if openai_path_prefix else "/v1/chat/completions"
+        url = f"{settings.mantle_base_url}{path}"
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     return url, headers
 
 
-async def call(contract: Contract, payload: dict, extra_headers: dict) -> tuple[int, dict, dict]:
+async def call(
+    contract: Contract, payload: dict, extra_headers: dict, openai_path_prefix: bool = False
+) -> tuple[int, dict, dict]:
     """Non-streaming call. Returns (status_code, parsed_json_body, headers)."""
     token = await get_bedrock_token()
-    url, headers = _target(contract, extra_headers, token)
+    url, headers = _target(contract, extra_headers, token, openai_path_prefix)
     async with httpx.AsyncClient(timeout=settings.request_timeout) as client:
         resp = await client.post(url, json=payload, headers=headers)
     try:
@@ -52,10 +60,12 @@ async def call(contract: Contract, payload: dict, extra_headers: dict) -> tuple[
 
 
 @asynccontextmanager
-async def open_stream(contract: Contract, payload: dict, extra_headers: dict):
+async def open_stream(
+    contract: Contract, payload: dict, extra_headers: dict, openai_path_prefix: bool = False
+):
     """Async context manager yielding the live httpx streaming response."""
     token = await get_bedrock_token()
-    url, headers = _target(contract, extra_headers, token)
+    url, headers = _target(contract, extra_headers, token, openai_path_prefix)
     headers = {
         **headers,
         "Accept": "text/event-stream",

@@ -14,7 +14,7 @@ import httpx
 from . import mantle_client
 from .contracts import Contract
 from .logging_context import current_model
-from .model_registry import resolve_contract
+from .model_registry import needs_openai_v1_prefix, resolve_contract
 from .translation import converters as tr
 
 logger = logging.getLogger(__name__)
@@ -50,10 +50,15 @@ async def handle_request(entry: Contract, body: dict, extra_headers: dict) -> tu
     # after this coroutine returns) — nothing to set/reset here.
     model = body.get("model", "")
     target = await resolve_contract(model)
-    logger.info("Routing entry=%s target=%s", entry.value, target.value)
+    openai_path_prefix = needs_openai_v1_prefix(model) if target == Contract.OPENAI else False
+    logger.info(
+        "Routing entry=%s target=%s openai_path_prefix=%s", entry.value, target.value, openai_path_prefix
+    )
 
     payload = _translate_request(entry, target, body)
-    status, resp_body, _ = await mantle_client.call(target, payload, extra_headers)
+    status, resp_body, _ = await mantle_client.call(
+        target, payload, extra_headers, openai_path_prefix=openai_path_prefix
+    )
 
     if status >= 400:
         return status, _translate_error(entry, target, resp_body)
@@ -70,12 +75,20 @@ async def handle_stream(entry: Contract, body: dict, extra_headers: dict) -> Asy
     token = current_model.set(model or "-")
     try:
         target = await resolve_contract(model)
-        logger.info("Routing (stream) entry=%s target=%s", entry.value, target.value)
+        openai_path_prefix = needs_openai_v1_prefix(model) if target == Contract.OPENAI else False
+        logger.info(
+            "Routing (stream) entry=%s target=%s openai_path_prefix=%s",
+            entry.value,
+            target.value,
+            openai_path_prefix,
+        )
 
         payload = _translate_request(entry, target, body)
 
         try:
-            async with mantle_client.open_stream(target, payload, extra_headers) as resp:
+            async with mantle_client.open_stream(
+                target, payload, extra_headers, openai_path_prefix=openai_path_prefix
+            ) as resp:
                 logger.info(
                     "Mantle %s stream status=%s headers=%s", target.value, resp.status_code, dict(resp.headers)
                 )
