@@ -1,49 +1,49 @@
-# Bedrock Mantle Reverse Proxy
+# aws-bedrock-mantle-proxy
 
-Proxy reverso que expõe uma API compatível com **Anthropic** (`/v1/messages`) e uma compatível com **OpenAI** (`/v1/chat/completions`, `/v1/models`), redirecionando as requisições para o **Amazon Bedrock Mantle** por trás.
+Reverse proxy that exposes an **Anthropic**-compatible API (`/v1/messages`) and an **OpenAI**-compatible API (`/v1/chat/completions`, `/v1/models`), forwarding requests to **Amazon Bedrock Mantle** behind the scenes.
 
-Isso permite plugar ferramentas como **Claude Code**, **QwenCode** ou **Pi Harness** apontando-as para este proxy local — elas continuam "achando" que estão falando com a Anthropic ou com a OpenAI, mas as requisições são autenticadas e encaminhadas para o Mantle.
+This lets you plug tools like **Claude Code**, **QwenCode**, or **Pi Harness** into this local proxy — they still "think" they're talking to Anthropic or OpenAI, but requests are authenticated and forwarded to Mantle.
 
-## Por que isso existe
+## Why this exists
 
-O Mantle não permite gerar uma chave de API estática por requisitos de segurança. O acesso precisa ser feito via SDK da AWS, gerando um **bearer token de curta duração** a cada chamada com a biblioteca [`aws-bedrock-token-generator`](https://pypi.org/project/aws-bedrock-token-generator/), a partir das credenciais AWS já configuradas na máquina (perfil, SSO, role assumida, variáveis de ambiente etc.).
+Mantle doesn't allow issuing a static API key due to security requirements. Access must go through the AWS SDK, generating a **short-lived bearer token** on every call with the [`aws-bedrock-token-generator`](https://pypi.org/project/aws-bedrock-token-generator/) library, derived from AWS credentials already configured on the machine (profile, SSO, assumed role, environment variables, etc.).
 
-O Mantle já expõe nativamente uma API compatível com OpenAI em `https://bedrock-mantle.{region}.api.aws/v1`. Este proxy:
+Mantle already natively exposes an OpenAI-compatible API at `https://bedrock-mantle.{region}.api.aws/v1`. This proxy:
 
-1. Repassa quase que diretamente chamadas no formato OpenAI (injetando o token em cada requisição).
-2. Traduz chamadas no formato Anthropic Messages API para o formato OpenAI antes de enviar ao Mantle, e traduz a resposta de volta — inclusive em streaming (SSE).
+1. Forwards OpenAI-shaped calls almost directly (injecting the token on every request).
+2. Translates Anthropic Messages API calls into OpenAI format before sending them to Mantle, and translates the response back — including streaming (SSE).
 
-## Arquitetura
+## Architecture
 
 ```
 app/
-  config.py                       # variáveis de ambiente / configuração
-  auth.py                         # gera um token Mantle novo a cada requisição
-  main.py                         # app FastAPI, registra os routers
+  config.py                       # environment variables / configuration
+  auth.py                         # mints a fresh Mantle token on every request
+  main.py                         # FastAPI app, registers the routers
   routers/
-    anthropic_router.py           # POST /v1/messages  (traduz Anthropic <-> OpenAI)
+    anthropic_router.py           # POST /v1/messages  (translates Anthropic <-> OpenAI)
     openai_router.py              # GET /v1/models, POST /v1/chat/completions (passthrough)
   translation/
     anthropic_to_openai.py        # request: Anthropic Messages -> OpenAI Chat Completions
-    openai_to_anthropic.py        # response: OpenAI (JSON e streaming SSE) -> Anthropic Messages
+    openai_to_anthropic.py        # response: OpenAI (JSON and streaming SSE) -> Anthropic Messages
 tests/
-  test_translation.py             # testes unitários da tradução (sem rede/AWS)
+  test_translation.py             # unit tests for the translation layer (no network/AWS)
 main.py                           # entrypoint (uvicorn)
 ```
 
-### Fluxo
+### Flow
 
-- **Ferramentas OpenAI-compatible** (QwenCode, Pi Harness, SDK OpenAI genérico) → `POST /v1/chat/completions` ou `GET /v1/models` → proxy injeta o Bearer token → encaminha para o Mantle sem alterar o corpo.
-- **Claude Code** (fala o formato Anthropic) → `POST /v1/messages` → proxy traduz a requisição para o formato OpenAI, chama o Mantle, traduz a resposta (ou o stream) de volta para o formato Anthropic.
+- **OpenAI-compatible tools** (QwenCode, Pi Harness, generic OpenAI SDK) → `POST /v1/chat/completions` or `GET /v1/models` → proxy injects the Bearer token → forwards to Mantle without modifying the body.
+- **Claude Code** (speaks the Anthropic format) → `POST /v1/messages` → proxy translates the request into OpenAI format, calls Mantle, translates the response (or stream) back into Anthropic format.
 
-O nome do modelo (`model`) é repassado como o cliente enviar — **não há mapeamento de nomes amigáveis**. Use `GET /v1/models` para listar os IDs reais disponíveis no Bedrock e aponte suas ferramentas diretamente para eles.
+The model name (`model`) is passed through exactly as the client sends it — **there is no friendly-name mapping**. Use `GET /v1/models` to list the real IDs available on Bedrock and point your tools directly at them.
 
-## Pré-requisitos
+## Prerequisites
 
 - Python 3.11+
-- Credenciais AWS configuradas localmente com acesso ao Bedrock Mantle (perfil em `~/.aws/credentials`, SSO, variáveis de ambiente ou role assumida) — a resolução usa a cadeia padrão do boto3.
+- AWS credentials configured locally with access to Bedrock Mantle (profile in `~/.aws/credentials`, SSO, environment variables, or an assumed role) — resolution uses boto3's default credential chain.
 
-## Instalação
+## Installation
 
 ```bash
 python -m venv .venv
@@ -53,67 +53,67 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-## Configuração
+## Configuration
 
-Copie o arquivo de exemplo e ajuste conforme necessário:
+Copy the example file and adjust as needed:
 
 ```bash
 cp .env.example .env
 ```
 
-| Variável | Padrão | Descrição |
+| Variable | Default | Description |
 |---|---|---|
-| `AWS_REGION` | `us-east-1` | Região onde o Bedrock Mantle está disponível |
-| `MANTLE_BASE_URL` | `https://bedrock-mantle.{AWS_REGION}.api.aws/v1` | Override do endpoint do Mantle |
-| `BEDROCK_TOKEN_TTL_SECONDS` | `3600` | Duração solicitada para cada token gerado (máx. 12h / 43200s) |
-| `MANTLE_REQUEST_TIMEOUT_SECONDS` | `300` | Timeout das requisições encaminhadas ao Mantle |
-| `PROXY_HOST` | `0.0.0.0` | Endereço de bind do servidor local |
-| `PROXY_PORT` | `8000` | Porta do servidor local |
+| `AWS_REGION` | `us-east-1` | Region where Bedrock Mantle is available |
+| `MANTLE_BASE_URL` | `https://bedrock-mantle.{AWS_REGION}.api.aws/v1` | Override for the Mantle endpoint |
+| `BEDROCK_TOKEN_TTL_SECONDS` | `3600` | Requested lifetime for each generated token (max 12h / 43200s) |
+| `MANTLE_REQUEST_TIMEOUT_SECONDS` | `300` | Timeout for requests forwarded to Mantle |
+| `PROXY_HOST` | `0.0.0.0` | Bind address for the local server |
+| `PROXY_PORT` | `8000` | Port for the local server |
 
-## Executando
+## Running
 
 ```bash
 python main.py
 ```
 
-O servidor sobe em `http://localhost:8000` (ou na porta configurada). Verifique com:
+The server starts at `http://localhost:8000` (or the configured port). Check it with:
 
 ```bash
 curl http://localhost:8000/healthz
 ```
 
-## Conectando as ferramentas
+## Connecting your tools
 
 ### Claude Code (Anthropic)
 
 ```bash
 export ANTHROPIC_BASE_URL=http://localhost:8000
-export ANTHROPIC_API_KEY=qualquer-valor   # ignorado pelo proxy; a auth real é feita no Mantle
+export ANTHROPIC_API_KEY=any-value   # ignored by the proxy; real auth happens against Mantle
 ```
 
-### Ferramentas OpenAI-compatible (QwenCode, Pi Harness, SDK OpenAI)
+### OpenAI-compatible tools (QwenCode, Pi Harness, OpenAI SDK)
 
 ```bash
 export OPENAI_BASE_URL=http://localhost:8000/v1
-export OPENAI_API_KEY=qualquer-valor      # ignorado pelo proxy; a auth real é feita no Mantle
+export OPENAI_API_KEY=any-value      # ignored by the proxy; real auth happens against Mantle
 ```
 
-Liste os modelos disponíveis no Bedrock:
+List the models available on Bedrock:
 
 ```bash
 curl http://localhost:8000/v1/models
 ```
 
-## Testes
+## Tests
 
-Os testes de tradução são unitários e não fazem chamadas de rede nem exigem credenciais AWS:
+The translation tests are unit tests and make no network calls or require AWS credentials:
 
 ```bash
 pytest tests/ -v
 ```
 
-## Limitações conhecidas
+## Known limitations
 
-- `/v1/messages/count_tokens` (Anthropic) não está implementado.
-- Em respostas **streaming** do endpoint `/v1/messages`, o campo `usage` pode vir zerado caso o Mantle não envie um chunk final com informações de uso. Em respostas não-streaming, o `usage` reportado é real.
-- Não há mapeamento de nomes amigáveis de modelo — o valor de `model` é repassado como veio da ferramenta cliente.
+- `/v1/messages/count_tokens` (Anthropic) is not implemented.
+- On **streaming** responses from `/v1/messages`, the `usage` field may come back zeroed if Mantle doesn't send a final chunk with usage information. Non-streaming responses report real usage.
+- There is no friendly model-name mapping — the `model` value is passed through exactly as sent by the client tool.
