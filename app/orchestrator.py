@@ -13,6 +13,7 @@ import httpx
 
 from . import mantle_client
 from .contracts import Contract
+from .logging_context import current_model
 from .model_registry import resolve_contract
 from .translation import converters as tr
 
@@ -44,9 +45,12 @@ def _translate_error(entry: Contract, target: Contract, resp_body: dict) -> dict
 
 
 async def handle_request(entry: Contract, body: dict, extra_headers: dict) -> tuple[int, dict]:
+    # The router already set current_model for the duration of this call
+    # (it needs the var alive for its own error-logging too, which runs
+    # after this coroutine returns) — nothing to set/reset here.
     model = body.get("model", "")
     target = await resolve_contract(model)
-    logger.info("Routing model=%s entry=%s target=%s", model, entry.value, target.value)
+    logger.info("Routing entry=%s target=%s", entry.value, target.value)
 
     payload = _translate_request(entry, target, body)
     status, resp_body, _ = await mantle_client.call(target, payload, extra_headers)
@@ -57,46 +61,55 @@ async def handle_request(entry: Contract, body: dict, extra_headers: dict) -> tu
 
 
 async def handle_stream(entry: Contract, body: dict, extra_headers: dict) -> AsyncIterator[bytes | str]:
+    # Unlike the non-streaming path, the router returns immediately after
+    # constructing the StreamingResponse — this generator body is what
+    # actually runs later, driven by Starlette as it sends the response. So
+    # current_model has to be set/reset in here, for the generator's own
+    # lifetime, not in the router.
     model = body.get("model", "")
-    target = await resolve_contract(model)
-    logger.info("Routing (stream) model=%s entry=%s target=%s", model, entry.value, target.value)
-
-    payload = _translate_request(entry, target, body)
-
+    token = current_model.set(model or "-")
     try:
-        async with mantle_client.open_stream(target, payload, extra_headers) as resp:
-            logger.info(
-                "Mantle %s stream status=%s headers=%s", target.value, resp.status_code, dict(resp.headers)
-            )
-            if resp.status_code >= 400:
-                error_body = await resp.aread()
-                logger.error(
-                    "Mantle returned an error for a streaming request: %s %s",
-                    resp.status_code,
-                    error_body[:2000],
+        target = await resolve_contract(model)
+        logger.info("Routing (stream) entry=%s target=%s", entry.value, target.value)
+
+        payload = _translate_request(entry, target, body)
+
+        try:
+            async with mantle_client.open_stream(target, payload, extra_headers) as resp:
+                logger.info(
+                    "Mantle %s stream status=%s headers=%s", target.value, resp.status_code, dict(resp.headers)
                 )
-                yield tr.format_error_sse(entry, error_body)
-                return
+                if resp.status_code >= 400:
+                    error_body = await resp.aread()
+                    logger.error(
+                        "Mantle returned an error for a streaming request: %s %s",
+                        resp.status_code,
+                        error_body[:2000],
+                    )
+                    yield tr.format_error_sse(entry, error_body)
+                    return
 
-            if entry == target:
-                chunk_count = 0
-                async for chunk in resp.aiter_bytes():
-                    chunk_count += 1
-                    yield chunk
-                logger.info("Mantle stream ended normally after %d chunk(s)", chunk_count)
-                return
+                if entry == target:
+                    chunk_count = 0
+                    async for chunk in resp.aiter_bytes():
+                        chunk_count += 1
+                        yield chunk
+                    logger.info("Mantle stream ended normally after %d chunk(s)", chunk_count)
+                    return
 
-            events = mantle_client.iter_sse_json(resp)
-            event_count = 0
-            if entry == Contract.ANTHROPIC:  # target == OPENAI
-                async for event in tr.translate_openai_stream_to_anthropic(events, model):
-                    event_count += 1
-                    yield event
-            else:  # entry == OPENAI, target == ANTHROPIC
-                async for event in tr.translate_anthropic_stream_to_openai(events, model):
-                    event_count += 1
-                    yield event
-            logger.info("Mantle stream translated into %d event(s)", event_count)
-    except httpx.HTTPError as exc:
-        logger.exception("Mantle stream request failed: %s", exc)
-        yield tr.format_error_sse(entry, str(exc).encode())
+                events = mantle_client.iter_sse_json(resp)
+                event_count = 0
+                if entry == Contract.ANTHROPIC:  # target == OPENAI
+                    async for event in tr.translate_openai_stream_to_anthropic(events, model):
+                        event_count += 1
+                        yield event
+                else:  # entry == OPENAI, target == ANTHROPIC
+                    async for event in tr.translate_anthropic_stream_to_openai(events, model):
+                        event_count += 1
+                        yield event
+                logger.info("Mantle stream translated into %d event(s)", event_count)
+        except httpx.HTTPError as exc:
+            logger.exception("Mantle stream request failed: %s", exc)
+            yield tr.format_error_sse(entry, str(exc).encode())
+    finally:
+        current_model.reset(token)

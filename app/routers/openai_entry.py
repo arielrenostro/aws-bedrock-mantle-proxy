@@ -6,6 +6,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from .. import mantle_client, orchestrator
 from ..contracts import Contract
+from ..logging_context import current_model
 
 router = APIRouter(prefix="/openai")
 logger = logging.getLogger(__name__)
@@ -23,11 +24,14 @@ async def chat_completions(request: Request):
     extra_headers = dict(request.headers)
 
     if body.get("stream"):
+        # handle_stream sets/resets current_model itself, for the lifetime
+        # of the generator (which runs after this function has returned).
         return StreamingResponse(
             orchestrator.handle_stream(Contract.OPENAI, body, extra_headers),
             media_type="text/event-stream",
         )
 
+    token = current_model.set(body.get("model") or "-")
     try:
         status, resp_body = await orchestrator.handle_request(Contract.OPENAI, body, extra_headers)
     except httpx.HTTPError as exc:
@@ -36,4 +40,6 @@ async def chat_completions(request: Request):
             status_code=502,
             content={"error": {"message": str(exc), "type": "api_error"}},
         )
+    finally:
+        current_model.reset(token)
     return JSONResponse(status_code=status, content=resp_body)
