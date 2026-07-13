@@ -278,3 +278,47 @@ async def test_anthropic_stream_to_openai_tool_use():
     assert '"name": "get_weather"' in joined
     assert '\\"location\\":' in joined
     assert '"finish_reason": "tool_calls"' in joined
+
+
+# ---------------------------------------------------------------------------
+# Mid-stream errors — Mantle (and OpenAI-compatible backends generally) can
+# send a failure as a data chunk over an otherwise-200 connection. Regression
+# tests for the Gemma-4-through-Claude-Code report: generation failed on
+# Mantle's side, but the error chunk had no "choices"/wasn't a recognized
+# Anthropic event type, so it was silently skipped and the stream ended up
+# looking like an empty, successful completion instead of a failure.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_openai_stream_mid_stream_error_is_surfaced_and_stops_the_stream():
+    chunks = [
+        {"choices": [{"delta": {"role": "assistant"}, "finish_reason": None}]},
+        {"error": {"code": "validation_error", "message": "Task submission failed: Generation failed"}},
+        # Should never be reached — the stream must stop at the error.
+        {"choices": [{"delta": {"content": "should not appear"}, "finish_reason": "stop"}]},
+    ]
+    events = [e async for e in translate_openai_stream_to_anthropic(_achunks(chunks), model="m")]
+    joined = "".join(events)
+
+    assert "event: error" in joined
+    assert "Task submission failed: Generation failed" in joined
+    assert "should not appear" not in joined
+    # The stream ends at the error — no fake successful completion follows.
+    assert "message_stop" not in joined
+
+
+@pytest.mark.asyncio
+async def test_anthropic_stream_mid_stream_error_is_surfaced_and_stops_the_stream():
+    events_in = [
+        {"type": "message_start", "message": {"usage": {"input_tokens": 1}}},
+        {"type": "error", "error": {"type": "api_error", "message": "overloaded_error: upstream failed"}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "should not appear"}},
+    ]
+    events = [e async for e in translate_anthropic_stream_to_openai(_achunks(events_in), model="m")]
+    joined = "".join(events)
+
+    assert "overloaded_error: upstream failed" in joined
+    assert '"type": "api_error"' in joined
+    assert "should not appear" not in joined
+    assert "[DONE]" not in joined

@@ -543,6 +543,24 @@ async def translate_openai_stream_to_anthropic(
     )
 
     async for chunk in chunks:
+        # Mantle (and OpenAI-compatible backends generally) can send a
+        # mid-stream failure as a `data: {"error": {...}}` chunk over an
+        # HTTP 200 connection — there's no non-2xx status to catch it by.
+        # Without this check the chunk has no "choices" and is silently
+        # skipped below, so the stream ends up looking like a normal,
+        # empty-but-successful completion instead of a failure.
+        if "error" in chunk:
+            err = chunk.get("error")
+            message = err.get("message") if isinstance(err, dict) else str(err)
+            yield _sse(
+                "error",
+                {
+                    "type": "error",
+                    "error": {"type": "api_error", "message": message or "upstream generation failed"},
+                },
+            )
+            return
+
         if chunk.get("usage"):
             u = chunk["usage"]
             state.prompt_tokens = u.get("prompt_tokens", state.prompt_tokens)
@@ -671,6 +689,17 @@ async def translate_anthropic_stream_to_openai(
 
     async for event in events:
         etype = event.get("type")
+
+        if etype == "error":
+            # The real Anthropic API (and, presumably, Mantle's native
+            # Anthropic endpoint) can send a mid-stream `event: error` over
+            # an otherwise-200 connection. Surface it rather than silently
+            # falling through to a fake successful completion.
+            err = event.get("error")
+            message = err.get("message") if isinstance(err, dict) else str(err)
+            payload = {"error": {"message": message or "upstream generation failed", "type": "api_error"}}
+            yield f"data: {json.dumps(payload)}\n\n"
+            return
 
         if etype == "message_start":
             usage = event.get("message", {}).get("usage", {})
