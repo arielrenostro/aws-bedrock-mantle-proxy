@@ -21,6 +21,33 @@ logger = logging.getLogger(__name__)
 DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
 
 
+def _strip_unsupported_anthropic_fields(payload: dict) -> dict:
+    """Mantle's native Anthropic Messages API endpoint doesn't support
+    structured outputs yet — a request carrying `output_config.format` is
+    rejected outright with `400 output_config.format: Extra inputs are not
+    permitted`, even though the field is valid on the real Anthropic API.
+    Claude Code sends it for some internal calls (e.g. session-title
+    generation via a json_schema format), which would otherwise hard-fail
+    every time. Drop just that sub-field rather than failing the whole
+    request; other output_config keys (e.g. effort) are left untouched.
+    """
+    output_config = payload.get("output_config")
+    if not isinstance(output_config, dict) or "format" not in output_config:
+        return payload
+
+    logger.warning(
+        "Dropping unsupported output_config.format before forwarding to Mantle's "
+        "Anthropic endpoint (structured outputs aren't supported there)."
+    )
+    payload = dict(payload)
+    remaining = {k: v for k, v in output_config.items() if k != "format"}
+    if remaining:
+        payload["output_config"] = remaining
+    else:
+        payload.pop("output_config", None)
+    return payload
+
+
 def _target(
     contract: Contract, extra_headers: dict, token: str, openai_path_prefix: bool = False
 ) -> tuple[str, dict]:
@@ -48,6 +75,8 @@ async def call(
     contract: Contract, payload: dict, extra_headers: dict, openai_path_prefix: bool = False
 ) -> tuple[int, dict, dict]:
     """Non-streaming call. Returns (status_code, parsed_json_body, headers)."""
+    if contract == Contract.ANTHROPIC:
+        payload = _strip_unsupported_anthropic_fields(payload)
     token = await get_bedrock_token()
     url, headers = _target(contract, extra_headers, token, openai_path_prefix)
     async with httpx.AsyncClient(timeout=settings.request_timeout) as client:
@@ -64,6 +93,8 @@ async def open_stream(
     contract: Contract, payload: dict, extra_headers: dict, openai_path_prefix: bool = False
 ):
     """Async context manager yielding the live httpx streaming response."""
+    if contract == Contract.ANTHROPIC:
+        payload = _strip_unsupported_anthropic_fields(payload)
     token = await get_bedrock_token()
     url, headers = _target(contract, extra_headers, token, openai_path_prefix)
     headers = {
